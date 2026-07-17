@@ -245,16 +245,19 @@ async function scrapeQFX() {
             return res.ok ? await res.json() : null;
         }, { movieId: movie.movie_id, date: targetDate, token: authToken });
 
-        const records = detailData?.Records?.data || [];
-        for (const show of records) {
-          const apiCineName = show.cine_name.trim();
-          const cleanApiName = apiCineName.replace(/QFX/gi, "").trim().toLowerCase();
+        const records = detailData?.Records || [];
+        for (const record of records) {
+          for (const cinema of record.CinemaDateArray || []) {
+            const apiCineName = cinema.cinema_name.trim();
+            const cleanApiName = apiCineName.replace(/QFX/gi, "").trim().toLowerCase();
+            
+            for (const show of cinema.ShowTimeArray || []) {
 
           let cinemaMatch = allCinemas.find(c => c.mall_name?.toLowerCase().includes(cleanApiName) || cleanApiName.includes(c.mall_name?.toLowerCase()));
 
           if (!cinemaMatch) {
-            console.log(`✨ Creating missing cinema: ${show.cine_name}`);
-            const { data: newCine } = await supabase.from("cinemas").insert({ mall_name: show.cine_name, chain_name: "QFX" }).select().single();
+            console.log(`✨ Creating missing cinema: ${cinema.cinema_name}`);
+            const { data: newCine } = await supabase.from("cinemas").insert({ mall_name: cinema.cinema_name, chain_name: "QFX" }).select().single();
             if (newCine) {
                 cinemaMatch = newCine;
                 allCinemas.push(newCine);
@@ -262,7 +265,7 @@ async function scrapeQFX() {
           }
 
           if (cinemaMatch) {
-            const startTime = `${show.ss_start_date}T${show.ss_start_show_time}:00`;
+            const startTime = `${record.ss_start_date}T${show.ss_start_show_time}:00`;
 
             // NEW: Fetch Price from Seat Layout
             let extractedPrice = null;
@@ -310,7 +313,9 @@ async function scrapeQFX() {
               console.error(`❌ DB Error for ${cleanTitle} showtime:`, sError.message);
             }
           }
-        }
+            } // end of ShowTimeArray loop
+          } // end of CinemaDateArray loop
+        } // end of Records loop
       }
     }
 

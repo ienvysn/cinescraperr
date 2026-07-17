@@ -34,7 +34,7 @@ jobs:
           set -euo pipefail
           npm run build
           nohup npm run start > server.log 2>&1 &
-          npx wait-on --timeout 120000 http-get://127.0.0.1:3000 || (echo "Next.js server failed to start (last 200 lines):" && tail -n 200 server.log && exit 1)
+          npx -y wait-on --timeout 120000 http-get://127.0.0.1:3000 || (echo "Next.js server failed to start (last 200 lines):" && tail -n 200 server.log && exit 1)
 
       - name: Run QFX Playwright Scraper
         env:
