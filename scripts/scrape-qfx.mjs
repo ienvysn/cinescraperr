@@ -95,6 +95,81 @@ async function getMovieDetails(page, movieId) {
   }
 }
 
+async function fetchIMDBDetails(page, title) {
+  try {
+    const suggestRes = await page.evaluate(async (t) => {
+      const res = await fetch(`https://v3.sg.media-imdb.com/suggestion/x/${encodeURIComponent(t)}.json`);
+      return res.ok ? await res.json() : null;
+    }, title);
+    
+    if (!suggestRes || !suggestRes.d || suggestRes.d.length === 0) return null;
+    
+    const movieObj = suggestRes.d.find(item => item.qid === "movie" || item.qid === "tvSeries");
+    if (!movieObj) return null;
+    
+    const imdbId = movieObj.id;
+    console.log(`      Found IMDb ID: ${imdbId}`);
+    
+    await page.goto(`https://www.imdb.com/title/${imdbId}/`, { waitUntil: "domcontentloaded", timeout: 30000 });
+    
+    const data = await page.evaluate(() => {
+        const script = document.querySelector('script[type="application/ld+json"]');
+        if (!script) return null;
+        try {
+            return JSON.parse(script.innerText);
+        } catch (e) {
+            return null;
+        }
+    });
+
+    if (!data) return null;
+
+    let duration = null;
+    if (data.duration) {
+        // e.g. PT2H28M
+        const match = data.duration.match(/PT(\d+H)?(\d+M)?/);
+        if (match) {
+            const h = match[1] ? match[1].replace('H', '') + 'h ' : '';
+            const m = match[2] ? match[2].replace('M', '') + 'min' : '';
+            duration = (h + m).trim();
+        }
+    }
+    
+    let director = null;
+    if (data.director) {
+        const d = Array.isArray(data.director) ? data.director[0] : data.director;
+        director = d?.name;
+    }
+    
+    let cast = null;
+    if (data.actor) {
+        const actors = Array.isArray(data.actor) ? data.actor : [data.actor];
+        cast = actors.slice(0, 3).map(a => a.name).join(', ');
+    }
+    
+    let genre = null;
+    if (data.genre) {
+        genre = Array.isArray(data.genre) ? data.genre.join(', ') : data.genre;
+    }
+
+    return {
+        duration,
+        genre,
+        director,
+        cast,
+        synopsis: data.description || null,
+        rating: data.aggregateRating?.ratingValue || null,
+        release_date: data.datePublished || null,
+        tmdb_id: -1, // Use -1 or null since it's IMDb
+        details_source: 'IMDb'
+    };
+
+  } catch (err) {
+    console.error(`❌ Error fetching IMDb details for ${title}:`, err.message);
+    return null;
+  }
+}
+
 async function scrapeQFX() {
   console.log("🚀 Launching Playwright for QFX Scrape...");
   const browser = await chromium.launch({ headless: true });
@@ -183,27 +258,31 @@ async function scrapeQFX() {
         console.log(`   - Director: ${richDetails.director}`);
         console.log(`   - Cast: ${richDetails.cast}`);
         console.log(`   - Genre: ${richDetails.genre}`);
-      } else {
-        console.log(`⚠️ Missing QFX metadata, attempting TMDB fallback for ${cleanTitle}...`);
-        const tmdbData = await fetchTMDBDetails(cleanTitle);
-        if (tmdbData) {
-            console.log(`✅ Found TMDB Metadata:`);
-            console.log(`   - Duration: ${tmdbData.duration}`);
-            console.log(`   - Director: ${tmdbData.director}`);
-            console.log(`   - Cast: ${tmdbData.cast}`);
+      }
+      
+      console.log(`📡 Fetching TMDB Metadata for ${cleanTitle}...`);
+      let tmdbData = await fetchTMDBDetails(cleanTitle);
+      
+      if (!tmdbData) {
+          console.log(`⚠️ TMDB failed. Attempting IMDb fallback for ${cleanTitle}...`);
+          tmdbData = await fetchIMDBDetails(page, cleanTitle);
+      }
 
-            // Merge metadata
-            richDetails = {
-                ...richDetails,
-                duration: richDetails?.duration || tmdbData.duration,
-                genre: richDetails?.genre || tmdbData.genre,
-                director: richDetails?.director || tmdbData.director,
-                cast: richDetails?.cast || tmdbData.cast,
-                synopsis: richDetails?.synopsis || tmdbData.synopsis,
-                rating: tmdbData.rating,
-                details_source: 'TMDB'
-            };
-        }
+      if (tmdbData) {
+          console.log(`✅ Found Metadata from ${tmdbData.details_source}`);
+          // Merge metadata
+          richDetails = {
+              ...richDetails,
+              duration: richDetails?.duration || tmdbData.duration,
+              genre: richDetails?.genre || tmdbData.genre,
+              director: richDetails?.director || tmdbData.director,
+              cast: richDetails?.cast || tmdbData.cast,
+              synopsis: richDetails?.synopsis || tmdbData.synopsis,
+              rating: tmdbData.rating,
+              release_date: tmdbData.release_date,
+              tmdb_id: tmdbData.tmdb_id,
+              details_source: tmdbData.details_source
+          };
       }
 
       const { data: movieRecord, error: mError } = await supabase
@@ -218,6 +297,8 @@ async function scrapeQFX() {
             director: richDetails?.director || null,
             cast: richDetails?.cast || null,
             rating: richDetails?.rating || null,
+            release_date: richDetails?.release_date || null,
+            tmdb_id: richDetails?.tmdb_id || -1,
           },
           { onConflict: "title" }
         )
