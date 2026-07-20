@@ -10,7 +10,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // Load env vars
-dotenv.config({ path: path.join(__dirname, "..", ".env.local") });
+dotenv.config({ path: path.join(__dirname, "..", ".env") });
 
 // Use stealth plugin
 chromium.use(stealth());
@@ -326,76 +326,77 @@ async function scrapeQFX() {
             return res.ok ? await res.json() : null;
         }, { movieId: movie.movie_id, date: targetDate, token: authToken });
 
-        const records = detailData?.Records || [];
+        let records = [];
+        if (Array.isArray(detailData?.Records)) {
+            records = detailData.Records;
+        } else if (detailData?.Records?.data) {
+            records = detailData.Records.data;
+        }
         for (const record of records) {
-          for (const cinema of record.CinemaDateArray || []) {
-            const apiCineName = cinema.cinema_name.trim();
+            const apiCineName = (record.cine_name || "").trim();
+            if (!apiCineName) continue;
             const cleanApiName = apiCineName.replace(/QFX/gi, "").trim().toLowerCase();
             
-            for (const show of cinema.ShowTimeArray || []) {
+            let cinemaMatch = allCinemas.find(c => c.mall_name?.toLowerCase().includes(cleanApiName) || cleanApiName.includes(c.mall_name?.toLowerCase()));
 
-          let cinemaMatch = allCinemas.find(c => c.mall_name?.toLowerCase().includes(cleanApiName) || cleanApiName.includes(c.mall_name?.toLowerCase()));
-
-          if (!cinemaMatch) {
-            console.log(`✨ Creating missing cinema: ${cinema.cinema_name}`);
-            const { data: newCine } = await supabase.from("cinemas").insert({ mall_name: cinema.cinema_name, chain_name: "QFX" }).select().single();
-            if (newCine) {
-                cinemaMatch = newCine;
-                allCinemas.push(newCine);
+            if (!cinemaMatch) {
+              console.log(`✨ Creating missing cinema: ${record.cine_name}`);
+              const { data: newCine } = await supabase.from("cinemas").insert({ mall_name: record.cine_name, chain_name: "QFX" }).select().single();
+              if (newCine) {
+                  cinemaMatch = newCine;
+                  allCinemas.push(newCine);
+              }
             }
-          }
 
-          if (cinemaMatch) {
-            const startTime = `${record.ss_start_date}T${show.ss_start_show_time}:00`;
+            if (cinemaMatch) {
+              const startTime = `${record.ss_start_date}T${record.ss_start_show_time}:00`;
 
-            // NEW: Fetch Price from Seat Layout
-            let extractedPrice = null;
-            try {
-               extractedPrice = await page.evaluate(async ({ screenId, ssId, mdId, token }) => {
-                 const res = await fetch("https://web-api.qfxcinemas.com/api/external/seat-layout", {
-                   method: "POST",
-                   headers: {
-                       "content-type": "application/json",
-                       "authorization": token
-                   },
-                   body: JSON.stringify({
-                     screen_id: screenId,
-                     ss_id: ssId,
-                     md_id: mdId,
-                     type_seat_show: 1
-                   }),
+              let extractedPrice = null;
+              try {
+                 extractedPrice = await page.evaluate(async ({ screenId, ssId, mdId, token }) => {
+                   const res = await fetch("https://web-api.qfxcinemas.com/api/external/seat-layout", {
+                     method: "POST",
+                     headers: {
+                         "content-type": "application/json",
+                         "authorization": token
+                     },
+                     body: JSON.stringify({
+                       screen_id: screenId,
+                       ss_id: ssId,
+                       md_id: mdId,
+                       type_seat_show: 1
+                     }),
+                   });
+                   if (!res.ok) return null;
+                   const data = await res.json();
+                   if (data.status && data.Records) {
+                     const recordsArr = Array.isArray(data.Records) ? data.Records : (data.Records.data || []);
+                     const firstSeat = recordsArr.find(s => s.seat_price);
+                     return firstSeat ? firstSeat.seat_price : null;
+                   }
+                   return null;
+                 }, {
+                   screenId: record.screen_id,
+                   ssId: record.ss_id,
+                   mdId: record.movie_details_id,
+                   token: authToken
                  });
-                 if (!res.ok) return null;
-                 const data = await res.json();
-                 if (data.status && data.Records) {
-                   const firstSeat = data.Records.find(s => s.seat_price);
-                   return firstSeat ? firstSeat.seat_price : null;
-                 }
-                 return null;
-               }, {
-                 screenId: show.screen_id,
-                 ssId: show.ss_id,
-                 mdId: show.movie_details_id,
-                 token: authToken
-               });
-            } catch (pErr) {
-               console.error(`⚠️ Failed to fetch price for ${cleanTitle} at ${cinemaMatch.mall_name}: ${pErr.message}`);
-            }
+              } catch (pErr) {
+                 console.error(`⚠️ Failed to fetch price for ${cleanTitle} at ${cinemaMatch.mall_name}: ${pErr.message}`);
+              }
 
-            const { error: sError } = await supabase.from("showtimes").upsert({
-              movie_id: movieRecord.id,
-              cinema_id: cinemaMatch.id,
-              start_time: startTime,
-              price: extractedPrice,
-              booking_url: `https://www.qfxcinemas.com/now-showing-booking/${movie.movie_id}/1`,
-            }, { onConflict: "movie_id, cinema_id, start_time" });
+              const { error: sError } = await supabase.from("showtimes").upsert({
+                movie_id: movieRecord.id,
+                cinema_id: cinemaMatch.id,
+                start_time: startTime,
+                price: extractedPrice,
+                booking_url: `https://www.qfxcinemas.com/now-showing-booking/${movie.movie_id}/1`,
+              }, { onConflict: "movie_id, cinema_id, start_time" });
 
-            if (sError) {
-              console.error(`❌ DB Error for ${cleanTitle} showtime:`, sError.message);
+              if (sError) {
+                console.error(`❌ DB Error for ${cleanTitle} showtime:`, sError.message);
+              }
             }
-          }
-            } // end of ShowTimeArray loop
-          } // end of CinemaDateArray loop
         } // end of Records loop
       }
     }
