@@ -1,7 +1,6 @@
-import { sendAlert } from "../../../lib/utils/alert";
-import { supabase } from "../../../lib/supabase";
-import { normalizeTitle } from "../../../lib/utils/normalize";
-import * as cheerio from "cheerio";
+import { sendAlert } from "../../../lib/utils/alert.js";
+import { supabase } from "../../../lib/supabase.js";
+import { normalizeTitle } from "../../../lib/utils/normalize.js";
 
 export const dynamic = "force-dynamic";
 
@@ -10,22 +9,27 @@ export default async function handler(req, res) {
   if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
     return res.status(401).json({ success: false, message: 'Unauthorized' });
   }
+
   try {
-    console.log("🚀 Starting Ini Cinemas Scrape...");
+    console.log("🚀 Starting INI Cinemas v1 Scrape...");
 
-    const targetDates = [];
-    const dateObjs = [];
-    for (let i = 0; i < 4; i++) {
-        const d = new Date();
-        d.setDate(d.getDate() + i);
-        const yyyy = d.getFullYear();
-        const mm = (d.getMonth() + 1).toString().padStart(2, "0");
-        const dd = d.getDate().toString().padStart(2, "0");
+    // 1. Fetch active dates from INI REST API
+    const datesRes = await fetch("https://api-prod.inicinemas.com/api/v1/shows/active-dates");
+    if (!datesRes.ok) {
+      throw new Error(`Failed to fetch active dates from INI API (Status ${datesRes.status})`);
+    }
+    const datesJson = await datesRes.json();
+    const datesArray = datesJson.data || datesJson || [];
+    const activeDates = Array.isArray(datesArray) ? datesArray.slice(0, 5) : [];
 
-        targetDates.push(`${mm}/${dd}/${yyyy}`);
-        dateObjs.push(`${yyyy}-${mm}-${dd}`);
+    if (activeDates.length === 0) {
+      console.log("No active dates found for INI Cinemas.");
+      return res.status(200).json({ success: true, message: "No active dates found." });
     }
 
+    console.log(`📅 Scraping INI Cinemas for dates: ${activeDates.join(", ")}`);
+
+    // 2. Fetch existing cinemas from Supabase DB
     const { data: allCinemas, error: cineError } = await supabase
       .from("cinemas")
       .select("id, mall_name, chain_name, location_url");
@@ -34,222 +38,162 @@ export default async function handler(req, res) {
       throw new Error(`Could not load cinemas from DB: ${cineError?.message}`);
     }
 
-    let totalMoviesProcessed = 0;
+    let totalShowsProcessed = 0;
 
-    for (let i = 0; i < targetDates.length; i++) {
-        const showDate = targetDates[i];
-        const isoDate = dateObjs[i];
-        console.log(`\n📅 Scraping Ini Cinemas for date: ${showDate}`);
+    for (const dateStr of activeDates) {
+      console.log(`\n🔍 Fetching INI schedule for date: ${dateStr}`);
+      const schedRes = await fetch(`https://api-prod.inicinemas.com/api/v1/shows/city-schedule?date=${dateStr}`);
 
-        const payload = {
-            PortalId: 1,
-            ShowDate: showDate,
-            AppPath: "/",
-            CurrentMovieID: 0,
-            username: "",
-            locationID: 0
-        };
+      if (!schedRes.ok) {
+        console.error(`❌ Failed schedule fetch for date ${dateStr}: ${schedRes.status}`);
+        continue;
+      }
 
-        const fetchRes = await fetch("https://inicinemas.com/Modules/CineSite/Movies/NowShowingWebService.asmx/GetNowShowing", {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json; charset=utf-8",
-                "Accept": "application/json"
-            },
-            body: JSON.stringify(payload)
-        });
+      const schedJson = await schedRes.json();
+      const scheduleData = schedJson.data || schedJson || {};
+      if (!scheduleData || typeof scheduleData !== "object") continue;
 
-        if (!fetchRes.ok) {
-            console.error(`❌ Failed to fetch from Ini Cinemas API: ${fetchRes.status}`);
-        await sendAlert(`Failed to fetch from Ini Cinemas API. Status: ${fetchRes.status}`);
-            return res.status(200).json({
-                success: false,
-                message: `Ini Cinemas API down (Status: ${fetchRes.status})`,
-                error: await fetchRes.text()
-            });
-        }
+      const locationKeys = Object.keys(scheduleData);
 
-        const jsonResponse = await fetchRes.json();
-        const data = jsonResponse.d;
+      for (const locId of locationKeys) {
+        const shows = scheduleData[locId];
+        if (!Array.isArray(shows) || shows.length === 0) continue;
 
-        if (!data || !Array.isArray(data) || data.length === 0) {
-            console.log(`No movies found for ${showDate}. Skipping.`);
+        for (const show of shows) {
+          if (!show.movie || !show.movie.title) continue;
+
+          const locationName = show.location_name ? show.location_name.trim() : "iNi Cinemas";
+          const rawMovieTitle = show.movie.title;
+          const cleanTitle = normalizeTitle(rawMovieTitle);
+
+          // Movie details mapping
+          const posterUrl = show.movie.movie_poster || show.movie.movie_banner || null;
+          const genre = show.movie.genre || null;
+
+          const { data: movieRecord, error: mError } = await supabase
+            .from("movies")
+            .upsert(
+              {
+                title: cleanTitle,
+                poster_url: posterUrl,
+                genre: genre,
+              },
+              { onConflict: "title" }
+            )
+            .select()
+            .single();
+
+          if (mError || !movieRecord) {
+            console.error(`⏩ Skipping movie ${cleanTitle}: ${mError?.message}`);
             continue;
-        }
+          }
 
-        console.log(`🎬 Picked up ${data.length} movies from Ini Cinemas.`);
-        totalMoviesProcessed += data.length;
+          // Cinema matching & auto-creation
+          const fullLocationName = locationName.startsWith("iNi") || locationName.startsWith("Ini")
+            ? locationName
+            : `Ini Cinemas - ${locationName}`;
 
-        for (const movie of data) {
-            const cleanTitle = normalizeTitle(movie.Movie);
+          let cinemaMatch = allCinemas.find((dbCine) => {
+            const dbNameClean = dbCine.mall_name ? dbCine.mall_name.toLowerCase().trim() : "";
+            const locNameClean = fullLocationName.toLowerCase().trim();
+            const locShortClean = locationName.toLowerCase().trim();
+            return (
+              dbNameClean === locNameClean ||
+              dbNameClean === locShortClean ||
+              dbNameClean.includes(locShortClean) ||
+              locShortClean.includes(dbNameClean)
+            );
+          });
 
-            const { data: movieRecord, error: mError } = await supabase
-                .from("movies")
-                .upsert(
-                    {
-                        title: cleanTitle,
-                        poster_url: movie.MediaPath_src
-                            ? `https://inicinemas.com${movie.MediaPath_src}`
-                            : null,
-                        genre: movie.Genre || null,
-                    },
-                    { onConflict: "title" },
-                )
-                .select()
-                .single();
+          if (!cinemaMatch) {
+            console.log(`✨ Creating missing INI Cinema in DB: "${fullLocationName}"`);
+            const { data: newCinema, error: createErr } = await supabase
+              .from("cinemas")
+              .insert({
+                mall_name: fullLocationName,
+                chain_name: "Ini Cinemas",
+              })
+              .select()
+              .single();
 
-            if (mError || !movieRecord) {
-                console.log(`⏩ Skipping movie ${cleanTitle}: ${mError?.message}`);
-                continue;
+            if (createErr || !newCinema) {
+              console.error(`❌ Failed to auto-create cinema "${fullLocationName}":`, createErr?.message);
+              continue;
+            } else {
+              console.log(`✅ Successfully created cinema: "${newCinema.mall_name}"`);
+              cinemaMatch = newCinema;
+              allCinemas.push(newCinema);
             }
+          }
 
-            for (const locID of [2, 4, 6]) {
-                try {
-                    const locRes = await fetch("https://inicinemas.com/Modules/CineSite/ShowDetail/ShowDetail.asmx/GetShowDetail", {
-                        method: "POST",
-                        headers: {
-                            "Content-Type": "application/json",
-                            "Accept": "application/json"
-                        },
-                        body: JSON.stringify({
-                            ShowDate: showDate,
-                            AppPath: "",
-                            CurrentMovieID: movie.MovieID.toString(),
-                            screenID: 0,
-                            locationID: locID.toString()
-                        })
-                    });
+          // Format start time string (e.g. "2026-07-28T11:30:00")
+          const startTimeIso = `${show.show_date}T${show.start_time}`;
 
-                    if (!locRes.ok) continue;
+          // Calculate ticket price
+          const showDateObj = new Date(show.show_date);
+          const dayOfWeek = showDateObj.getDay(); // 0=Sun, 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri, 6=Sat
+          const startHour = parseInt(show.start_time.split(":")[0], 10);
+          const isMorning = startHour < 12;
+          const isDealDay = dayOfWeek === 2 || dayOfWeek === 3;
+          const isWeekend = dayOfWeek === 0 || dayOfWeek === 5 || dayOfWeek === 6;
 
-                    const locData = await locRes.json();
-                    const html = locData.d;
-                    if (!html || html.trim() === "") continue;
+          let ticketPrice = null;
+          const locLower = fullLocationName.toLowerCase();
 
-                    const $ = cheerio.load(html);
-                    const mallNameRaw = $(".audi-info-desc p span").first().text().trim();
-                    if (!mallNameRaw) continue;
+          if (locLower.includes("lotse")) {
+            if (isDealDay) ticketPrice = 200;
+            else if (isWeekend) ticketPrice = isMorning ? 200 : 400;
+            else ticketPrice = isMorning ? 165 : 330;
+          } else if (locLower.includes("bishwojyoti")) {
+            if (isDealDay) ticketPrice = 200;
+            else if (isWeekend) ticketPrice = isMorning ? 175 : 350;
+            else ticketPrice = isMorning ? 150 : 300;
+          } else if (locLower.includes("nb") || locLower.includes("baneshwor")) {
+            if (isDealDay) ticketPrice = 200;
+            else if (isWeekend) ticketPrice = isMorning ? 225 : 450;
+            else ticketPrice = isMorning ? 175 : 350;
+          } else if (locLower.includes("butwal")) {
+            if (isDealDay) ticketPrice = 180;
+            else if (isWeekend) ticketPrice = isMorning ? 175 : 350;
+            else ticketPrice = isMorning ? 145 : 290;
+          } else if (locLower.includes("simara") || locLower.includes("devchuli") || locLower.includes("bhairahawa")) {
+            if (isDealDay) ticketPrice = 150;
+            else if (isWeekend) ticketPrice = isMorning ? 150 : 300;
+            else ticketPrice = isMorning ? 125 : 250;
+          }
 
-                    // Only process the three known Ini Cinemas halls
-                    const mallLowerCheck = mallNameRaw.toLowerCase();
-                    if (!mallLowerCheck.includes("lotse") && !mallLowerCheck.includes("bishwojyoti") && !mallLowerCheck.includes("nb")) {
-                        console.log(`⏩ Skipping unknown Ini location: "${mallNameRaw}"`);
-                        continue;
-                    }
+          const bookingUrl = show.id
+            ? `https://inicinemas.com/select-seat?show_id=${show.id}`
+            : "https://inicinemas.com/";
 
-                    const locationName = `Ini Cinemas - ${mallNameRaw}`;
+          const { error: sError } = await supabase.from("showtimes").upsert(
+            {
+              movie_id: movieRecord.id,
+              cinema_id: cinemaMatch.id,
+              start_time: startTimeIso,
+              price: ticketPrice,
+              booking_url: bookingUrl,
+            },
+            { onConflict: "movie_id, cinema_id, start_time" }
+          );
 
-                    let cinemaMatch = allCinemas.find((dbCine) => {
-                        const dbNameClean = dbCine.mall_name?.toLowerCase().trim() || "";
-                        const locNameClean = locationName.toLowerCase().trim();
-                        return dbNameClean === locNameClean || dbNameClean.includes(locNameClean) || locNameClean.includes(dbNameClean);
-                    });
-
-                    if (!cinemaMatch) {
-                        console.log(`✨ Creating missing Ini Cinema in DB: "${locationName}"`);
-                        const { data: newCinema, error: createErr } = await supabase
-                            .from("cinemas")
-                            .insert({
-                                mall_name: locationName,
-                                chain_name: "Ini Cinemas",
-                            })
-                            .select()
-                            .single();
-
-                        if (createErr || !newCinema) {
-                            console.error(`❌ Failed to auto-create cinema "${locationName}":`, createErr?.message);
-                            continue;
-                        } else {
-                            console.log(`✅ Successfully created cinema: "${newCinema.mall_name}"`);
-                            cinemaMatch = newCinema;
-                            allCinemas.push(newCinema);
-                        }
-                    }
-
-                    const showElements = $(".show-time-info li a").toArray();
-                    for (const el of showElements) {
-                        const timeText = $(el).text().trim(); // e.g. "05:30 PM"
-                        const href = $(el).attr("href"); // e.g. "/booking.aspx/movieid/30705/showid/62567"
-
-                        let [time, modifier] = timeText.split(" ");
-                        let [hours, minutes] = time.split(":");
-                        hours = parseInt(hours, 10);
-                        if (hours === 12) hours = 0;
-                        if (modifier === "PM") hours += 12;
-
-                        const formattedStartTime = `${isoDate}T${hours.toString().padStart(2, '0')}:${minutes.padStart(2, '0')}:00`;
-
-                        let bookingUrl = href;
-                        if (href && href !== "#") {
-                            if (href.startsWith("//")) {
-                                bookingUrl = `https:${href}`;
-                            } else if (href.startsWith("/")) {
-                                bookingUrl = `https://inicinemas.com${href}`;
-                            } else if (!href.startsWith("http")) {
-                                bookingUrl = `https://inicinemas.com/${href}`;
-                            }
-                        }
-
-                        // Ticket pricing logic
-                        const showDateObj = new Date(isoDate);
-                        const dayOfWeek = showDateObj.getDay(); // 0=Sun,1=Mon,...6=Sat
-                        const isMorning = hours < 12;
-                        const mallLower = mallNameRaw.toLowerCase();
-
-                        let ticketPrice = null;
-
-                        // Deal Days: Tue(2), Wed(3) — all day same price
-                        // Weekends: Fri(5), Sat(6), Sun(0)
-                        // Weekdays: Mon(1), Thu(4)
-                        const isDealDay = dayOfWeek === 2 || dayOfWeek === 3;
-                        const isWeekend = dayOfWeek === 0 || dayOfWeek === 5 || dayOfWeek === 6;
-
-                        if (mallLower.includes("lotse")) {
-                            // Lotse Mall, Gongabu
-                            if (isDealDay) ticketPrice = 200;
-                            else if (isWeekend) ticketPrice = isMorning ? 200 : 400;
-                            else ticketPrice = isMorning ? 165 : 330;
-                        } else if (mallLower.includes("bishwojyoti")) {
-                            // Bishwojyoti Mall, Jamal
-                            if (isDealDay) ticketPrice = 200;
-                            else if (isWeekend) ticketPrice = isMorning ? 175 : 350;
-                            else ticketPrice = isMorning ? 150 : 300;
-                        } else if (mallLower.includes("nb") || mallLower.includes("baneshwor")) {
-                            // NB Center, New Baneshwor
-                            if (isDealDay) ticketPrice = 200;
-                            else if (isWeekend) ticketPrice = isMorning ? 225 : 450;
-                            else ticketPrice = isMorning ? 175 : 350;
-                        }
-
-                        const { error: sError } = await supabase.from("showtimes").upsert(
-                            {
-                                movie_id: movieRecord.id,
-                                cinema_id: cinemaMatch.id,
-                                start_time: formattedStartTime,
-                                price: ticketPrice,
-                                booking_url: bookingUrl,
-                            },
-                            { onConflict: "movie_id, cinema_id, start_time" },
-                        );
-
-                        if (sError) {
-                            console.error(`❌ DB Error for ${cleanTitle} at ${locationName}:`, sError.message);
-                        }
-                    }
-                } catch (e) {
-                    console.error(`Error processing location ID ${locID} for movie ${cleanTitle}: ${e.message}`);
-                }
-            }
+          if (sError) {
+            console.error(`❌ DB Error for ${cleanTitle} at ${fullLocationName}:`, sError.message);
+          } else {
+            totalShowsProcessed++;
+          }
         }
+      }
     }
 
-    return res.status(200).json({
-        success: true,
-        message: `Sync Completed. Processed ${totalMoviesProcessed} movies across ${targetDates.length} days.`,
-    });
+    console.log(`✅ INI Cinemas Sync Completed. Processed ${totalShowsProcessed} showtimes.`);
 
+    return res.status(200).json({
+      success: true,
+      message: `INI Cinemas sync completed successfully. Processed ${totalShowsProcessed} showtimes.`,
+    });
   } catch (error) {
-    console.error("💥 Critical Scraper Error:", error.message);
+    console.error("💥 Critical INI Scraper Error:", error.message);
     await sendAlert(`Critical error in ini.js: ${error.message}`);
     return res.status(200).json({ success: false, error: error.message });
   }

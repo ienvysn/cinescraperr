@@ -3,6 +3,7 @@ import stealth from "puppeteer-extra-plugin-stealth";
 import { createClient } from "@supabase/supabase-js";
 import dotenv from "dotenv";
 import path from "path";
+import fs from "fs";
 import { fileURLToPath } from "url";
 import { fetchTMDBDetails } from "../lib/tmdb.js";
 
@@ -221,23 +222,38 @@ async function scrapeQFX() {
 
     // We execute the API fetch inside the browser to bypass Cloudflare
     const apiData = await page.evaluate(async (token) => {
-      const response = await fetch("https://web-api.qfxcinemas.com/api/external/quick-book", {
-        method: "POST",
-        headers: {
+      try {
+        let res = await fetch("https://web-api.qfxcinemas.com/api/cinema/admin/quick-book-list", {
+          method: "GET",
+          headers: {
+            "accept": "application/json",
+            "authorization": token
+          }
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data && (data.movies || data.data)) return data;
+        }
+
+        res = await fetch("https://web-api.qfxcinemas.com/api/external/quick-book", {
+          method: "POST",
+          headers: {
             "content-type": "application/json",
             "authorization": token
-        },
-        body: JSON.stringify({}),
-      });
-      return response.ok ? await response.json() : null;
+          },
+          body: JSON.stringify({}),
+        });
+        return res.ok ? await res.json() : null;
+      } catch (e) {
+        return null;
+      }
     }, authToken);
 
-    if (!apiData || !apiData.movies) {
+    const movies = apiData?.movies || apiData?.data || [];
+    if (!movies || movies.length === 0) {
       console.error("❌ Failed to fetch movies from browser context.");
       return;
     }
-
-    const movies = apiData.movies;
     const uniqueMovies = Array.from(new Map(movies.map((m) => [m.movie_id, m])).values());
     console.log(`🎬 Found ${uniqueMovies.length} unique movies.`);
 
