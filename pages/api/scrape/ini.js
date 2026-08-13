@@ -69,6 +69,9 @@ export default async function handler(req, res) {
           // Movie details mapping
           const posterUrl = show.movie.movie_poster || show.movie.movie_banner || null;
           const genre = show.movie.genre || null;
+          const duration = show.movie.duration ? parseInt(show.movie.duration, 10) : null;
+          const synopsis = show.movie.description || null;
+          const director = show.movie.director || null;
 
           const { data: movieRecord, error: mError } = await supabase
             .from("movies")
@@ -77,6 +80,9 @@ export default async function handler(req, res) {
                 title: cleanTitle,
                 poster_url: posterUrl,
                 genre: genre,
+                duration: duration,
+                synopsis: synopsis,
+                director: director,
               },
               { onConflict: "title" }
             )
@@ -162,9 +168,12 @@ export default async function handler(req, res) {
             else ticketPrice = isMorning ? 125 : 250;
           }
 
-          const bookingUrl = show.id
-            ? `https://inicinemas.com/select-seat?show_id=${show.id}`
-            : "https://inicinemas.com/";
+          const movieSlug = cleanTitle
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-')
+            .replace(/(^-|-$)/g, '');
+
+          const bookingUrl = `https://inicinemas.com/movie/${movieSlug}?date=${show.show_date}`;
 
           const { error: sError } = await supabase.from("showtimes").upsert(
             {

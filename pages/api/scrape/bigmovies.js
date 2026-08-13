@@ -53,6 +53,7 @@ export default async function handler(req, res) {
         "https://bigmovies.com.np/Modules/CineSite/Movies/NowShowingWebService.asmx/GetNowShowing",
         {
           method: "POST",
+          cache: "no-store",
           headers: {
             "Content-Type": "application/json; charset=utf-8",
             Accept: "application/json",
